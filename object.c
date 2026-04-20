@@ -1,4 +1,5 @@
 // object.c — Content-addressable object store
+
 #include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,8 +12,9 @@
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 void hash_to_hex(const ObjectID *id, char *hex_out) {
-    for (int i = 0; i < HASH_SIZE; i++)
+    for (int i = 0; i < HASH_SIZE; i++) {
         sprintf(hex_out + i * 2, "%02x", id->hash[i]);
+    }
     hex_out[HASH_HEX_SIZE] = '\0';
 }
 
@@ -47,73 +49,88 @@ int object_exists(const ObjectID *id) {
     return access(path, F_OK) == 0;
 }
 
-// ─── TODO: object_write ───────────────────────────────────────────────────────
+// ─── IMPLEMENTED ─────────────────────────────────────────────────────────────
 
+// Write object
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    const char *type_str;
-    if      (type == OBJ_BLOB)   type_str = "blob";
-    else if (type == OBJ_TREE)   type_str = "tree";
-    else if (type == OBJ_COMMIT) type_str = "commit";
-    else return -1;
-
-    // Build header: "<type> <size>\0"
     char header[64];
+    const char *type_str;
+
+    // Convert type to string
+    if (type == OBJ_BLOB) type_str = "blob";
+    else if (type == OBJ_TREE) type_str = "tree";
+    else type_str = "commit";
+
+    // Build header "blob <size>\0"
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
 
+    // Combine header + data
     size_t total_len = header_len + len;
-    char *buffer = malloc(total_len);
-    if (!buffer) return -1;
+    char *full = malloc(total_len);
+    if (!full) return -1;
 
-    memcpy(buffer, header, header_len);
-    memcpy(buffer + header_len, data, len);
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
 
-    // Compute SHA-256 of full object
-    compute_hash(buffer, total_len, id_out);
+    // Compute hash
+    compute_hash(full, total_len, id_out);
 
-    // Deduplication: already stored? skip.
+    // Deduplication
     if (object_exists(id_out)) {
-        free(buffer);
+        free(full);
         return 0;
     }
 
-    char hex[HASH_HEX_SIZE + 1];
-    hash_to_hex(id_out, hex);
-
-    // Create shard directory .pes/objects/XX/
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s/%.2s", OBJECTS_DIR, hex);
-    mkdir(OBJECTS_DIR, 0755);
-    mkdir(dir, 0755);
-
+    // Build path
     char path[512];
     object_path(id_out, path, sizeof(path));
 
-    // Write to temp file, then atomically rename
-    char tmp_path[512];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    // Extract directory
+    char dir[512];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
 
-    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) { free(buffer); return -1; }
+    // Create shard directory
+    mkdir(dir, 0755);
 
-    if (write(fd, buffer, total_len) != (ssize_t)total_len) {
-        close(fd); free(buffer); return -1;
+    // Temporary file
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s/tempXXXXXX", dir);
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    // Write data
+    if (write(fd, full, total_len) != (ssize_t)total_len) {
+        close(fd);
+        free(full);
+        return -1;
     }
 
     fsync(fd);
     close(fd);
-    free(buffer);
 
-    if (rename(tmp_path, path) != 0) return -1;
+    // Atomic rename
+    if (rename(temp_path, path) != 0) {
+        free(full);
+        return -1;
+    }
 
-    // fsync the directory too
-    int dir_fd = open(dir, O_DIRECTORY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    // fsync directory
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) {
+        fsync(dfd);
+        close(dfd);
+    }
 
+    free(full);
     return 0;
 }
 
-// ─── TODO: object_read ───────────────────────────────────────────────────────
-
+// Read object
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
     char path[512];
     object_path(id, path, sizeof(path));
@@ -121,41 +138,66 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     FILE *fp = fopen(path, "rb");
     if (!fp) return -1;
 
+    // File size
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
     rewind(fp);
 
-    char *buffer = malloc(size);
-    if (!buffer) { fclose(fp); return -1; }
+    if (size <= 0) {
+        fclose(fp);
+        return -1;
+    }
 
-    fread(buffer, 1, size, fp);
+    // Read file
+    char *buffer = malloc(size);
+    if (!buffer) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (fread(buffer, 1, size, fp) != (size_t)size) {
+        fclose(fp);
+        free(buffer);
+        return -1;
+    }
     fclose(fp);
 
-    // Verify integrity: recompute hash and compare to filename
+    // Verify hash
     ObjectID check;
     compute_hash(buffer, size, &check);
     if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
-        free(buffer); return -1;
+        free(buffer);
+        return -1;
     }
 
-    // Parse header: "<type> <size>\0<data>"
-    char *null_ptr = memchr(buffer, '\0', size);
-    if (!null_ptr) { free(buffer); return -1; }
+    // Find '\0'
+    char *null_pos = memchr(buffer, '\0', size);
+    if (!null_pos) {
+        free(buffer);
+        return -1;
+    }
 
+    // Parse header
     char type_str[10];
-    sscanf(buffer, "%9s %zu", type_str, len_out);
+    size_t data_size;
+    sscanf(buffer, "%s %zu", type_str, &data_size);
 
-    if      (strcmp(type_str, "blob")   == 0) *type_out = OBJ_BLOB;
-    else if (strcmp(type_str, "tree")   == 0) *type_out = OBJ_TREE;
-    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
-    else { free(buffer); return -1; }
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else *type_out = OBJ_COMMIT;
 
-    size_t header_len = (null_ptr - buffer) + 1;
+    // Extract data
+    char *data_start = null_pos + 1;
 
-    *data_out = malloc(*len_out);
-    if (!(*data_out)) { free(buffer); return -1; }
+    *data_out = malloc(data_size);
+    if (!*data_out) {
+        free(buffer);
+        return -1;
+    }
 
-    memcpy(*data_out, buffer + header_len, *len_out);
+    memcpy(*data_out, data_start, data_size);
+    *len_out = data_size;
+
     free(buffer);
     return 0;
 }
