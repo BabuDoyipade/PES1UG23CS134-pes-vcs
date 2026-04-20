@@ -56,15 +56,12 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char header[64];
     const char *type_str;
 
-    // Convert type to string
     if (type == OBJ_BLOB) type_str = "blob";
     else if (type == OBJ_TREE) type_str = "tree";
     else type_str = "commit";
 
-    // Build header "blob <size>\0"
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
 
-    // Combine header + data
     size_t total_len = header_len + len;
     char *full = malloc(total_len);
     if (!full) return -1;
@@ -72,16 +69,17 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     memcpy(full, header, header_len);
     memcpy(full + header_len, data, len);
 
-    // Compute hash
     compute_hash(full, total_len, id_out);
 
-    // Deduplication
     if (object_exists(id_out)) {
         free(full);
         return 0;
     }
 
-    // Build path
+    // 🔥 IMPORTANT: Ensure base directory exists
+    mkdir(".pes", 0755);
+    mkdir(".pes/objects", 0755);
+
     char path[512];
     object_path(id_out, path, sizeof(path));
 
@@ -91,21 +89,21 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char *slash = strrchr(dir, '/');
     if (slash) *slash = '\0';
 
-    // Create shard directory
     mkdir(dir, 0755);
 
-    // Temporary file
     char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s/tempXXXXXX", dir);
+    snprintf(temp_path, sizeof(temp_path), "%s/tmpXXXXXX", dir);
+
     int fd = mkstemp(temp_path);
     if (fd < 0) {
         free(full);
         return -1;
     }
 
-    // Write data
-    if (write(fd, full, total_len) != (ssize_t)total_len) {
+    ssize_t written = write(fd, full, total_len);
+    if (written != (ssize_t)total_len) {
         close(fd);
+        unlink(temp_path);
         free(full);
         return -1;
     }
@@ -113,13 +111,12 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     fsync(fd);
     close(fd);
 
-    // Atomic rename
     if (rename(temp_path, path) != 0) {
+        unlink(temp_path);
         free(full);
         return -1;
     }
 
-    // fsync directory
     int dfd = open(dir, O_RDONLY);
     if (dfd >= 0) {
         fsync(dfd);
